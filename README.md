@@ -9,6 +9,7 @@
 |---|---|
 | [`docs/DESIGN.md`](docs/DESIGN.md) | **项目说明**：设计取舍、探测发现的规则（张数不是自由变量等）、成本模型、已知未知 |
 | [`docs/API.md`](docs/API.md) | **接口契约**：参数定义、返回结构、错误码、积分与复用约束 |
+| [`docs/REVIEW.md`](docs/REVIEW.md) | **代码审查记录**：12 处缺陷的定位、后果、修复与回归用例 |
 
 ## 快速开始
 
@@ -68,35 +69,37 @@ python -m jimeng models          # confidence 由 default 变为 calibrated
 jimeng/
   __main__.py     python -m jimeng 入口
   sign.py         设备身份 + MD5 签名（Device-Time / Sign）
-  catalog.py      模型·比例·分辨率目录（可被探测校准）
-  request.py      GenerateRequest → Plan（校验 + 成本预估）
+  catalog.py      模型·比例·分辨率目录（启动校验 + 可被探测校准）
+  request.py      GenerateRequest → 不可变 Plan（严格参数 + 成本预估）
   payload.py      Plan → draft_content（嵌套报文编译）
   upload.py       参考图上传（proof → ImageX → 审核）
-  credits.py      积分账本（预留 / 结算 / 日配额）
-  client.py       单账号编排（提交 / 轮询 / 幂等缓存）
+  credits.py      积分账本（不可变快照 / 预留结算 / 日配额）
+  cache.py        TTL + LRU 幂等缓存（按值存取）
+  client.py       单账号编排（上传 / 提交 / 轮询 / 结算）
   parsing.py      上游返回的容错解析
   accounts.py     多账号池（可用余额优先）
   probe.py        能力探测（static / auth / count / ratio / resolution / cost）
-  gateway.py      REST 网关（零依赖）
-  transport.py    urllib 传输层（有限重试）
+  gateway.py      REST 网关（表驱动路由，零依赖）
+  transport.py    urllib 传输层（重试策略显式化）
 docs/
   DESIGN.md       项目说明与探测规则
   API.md          接口规格
+  REVIEW.md       代码审查记录
 examples/
   quickstart.py   最小可运行示例
 tests/
-  test_offline.py 23 项离线测试（FakeTransport，不触网）
+  test_offline.py 27 项离线测试（FakeTransport，不触网）
 ```
 
 ## 测试
 
 ```bash
 python -m unittest discover -s tests -v
-# Ran 23 tests ... OK
+# Ran 27 tests ... OK
 ```
 
-覆盖：报文正确性、最小计费粒度、能力拦截、资金安全（预算/配额/余额）、幂等缓存、
-图生图链路、余额与历史解析容错、探测预算闸门、网关路由。
+覆盖：报文正确性、最小计费粒度、能力拦截、资金安全（预算/配额/余额/预留释放）、幂等缓存隔离、
+图生图链路、余额与历史解析容错、探测预算闸门、网关路由与 pending 回查、POST 不自动重试。
 
 ## 风险提示
 

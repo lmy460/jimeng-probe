@@ -3,7 +3,7 @@
 > 目标：把「即梦网页版」的免费额度生图能力封装为一个**幂等、可预算、可审计**的本地服务，
 > 并把附加图片 / 选模型 / 比例 / 分辨率 / 生成张数这五类网页操作抽象成稳定参数。
 >
-> 本文件是接口契约。实现见 `jimeng/`，自检见 `python -m unittest discover -s tests -v`（23 项全通过）。
+> 本文件是接口契约。实现见 `jimeng/`，自检见 `python -m unittest discover -s tests -v`（27 项全通过）。
 > 设计取舍与探测结论（「张数不是自由变量」等规则）见 [`DESIGN.md`](DESIGN.md)。
 
 ---
@@ -71,6 +71,9 @@ jimeng.jianying.com (/mweb/v1/*, /commerce/v1/*)
 - Base URL：`http://127.0.0.1:8787`
 - 编码：UTF-8 JSON；时间戳为 Unix 秒；像素为整数；积分可含小数
 - 幂等：`idempotency_key`（或请求指纹）相同 → 直接返回缓存结果，`credits_charged = 0`，`cached = true`，TTL 24h
+- 参数严格：**未知字段直接返回 400**（`details.allowed` 列出全部合法键），避免拼写错误静默走默认值
+- 重试：仅幂等请求（GET / 余额 / 历史查询）自动重试；`generate`、上传等非幂等 POST **不自动重试**
+- 可观测：每个响应带 `X-Request-Id`；错误体里同一 id 出现在 `error.request_id`
 - 单位：`n` 为"期望张数"，`submissions` 为"实际提交次数"，二者在 4.x 上不相等
 - 错误：一律返回 `{"error": {...}}`，HTTP 状态码语义与 `code` 并行提供
 
@@ -432,7 +435,8 @@ settle(actual = 余额前 - 余额后, update_balance=False)
 3. **禁止对 `RISK_CONTROL` 重试**：重试只会加重风控标记。
 4. **禁止把 `n` 当无序批量**：`n > K` 会拆多次提交，成本线性叠加，必须提前告知上游调用方。
 5. **禁止在响应/日志中回显 sessionid**：`account.redacted()` 已截断。
-6. **禁止用免费额度做商业转售**：见第 14 节合规边界。
+6. **禁止对非幂等 POST 自动重试**：重放 `generate` 等于二次提交、二次扣费；传输层默认 `retry=0`。
+7. **禁止用免费额度做商业转售**：见第 14 节合规边界。
 
 ---
 

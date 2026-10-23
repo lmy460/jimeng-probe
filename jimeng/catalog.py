@@ -14,6 +14,8 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
+from .errors import ParamInvalid
+
 # ---------------------------------------------------------------------------
 # 比例：网页端 image_ratio 是枚举码，不是字符串
 # ---------------------------------------------------------------------------
@@ -97,7 +99,7 @@ class ModelSpec:
             "supports_reference": self.supports_reference,
             "supports_intelligent_ratio": self.supports_intelligent_ratio,
             "max_reference_images": self.max_reference_images,
-            "credits_per_image": self.credits_per_image,
+            "credits_per_image": dict(self.credits_per_image),
             "confidence": self.confidence,
             "note": self.note,
         }
@@ -178,11 +180,38 @@ _DEFAULT_MODELS: Tuple[ModelSpec, ...] = (
 DEFAULT_MODEL = "jimeng-4.5"
 
 
+def _validate(specs: List[ModelSpec]) -> None:
+    """目录是手写常量，容易写错；宁可启动即失败，也不要线上才发现码值不存在。"""
+    seen = set()
+    for spec in specs:
+        if spec.name in seen:
+            raise ValueError(f"模型重复定义: {spec.name}")
+        seen.add(spec.name)
+        if spec.outputs_per_submit < 1:
+            raise ValueError(f"{spec.name}: outputs_per_submit 必须 >= 1")
+        if not spec.resolutions:
+            raise ValueError(f"{spec.name}: resolutions 不能为空")
+        unknown_res = set(spec.resolutions) - set(RESOLUTION_DIMS)
+        if unknown_res:
+            raise ValueError(f"{spec.name}: 未知分辨率 {sorted(unknown_res)}")
+        unknown_ratio = set(spec.ratios) - set(RATIO_CODES)
+        if unknown_ratio:
+            raise ValueError(f"{spec.name}: 未知比例 {sorted(unknown_ratio)}")
+        for resolution, unit in spec.credits_per_image.items():
+            if resolution not in RESOLUTION_DIMS:
+                raise ValueError(f"{spec.name}: 单价表含未知分辨率 {resolution}")
+            if unit < 0:
+                raise ValueError(f"{spec.name}: 单价不能为负")
+        if spec.max_reference_images < 0:
+            raise ValueError(f"{spec.name}: max_reference_images 不能为负")
+
+
 class Catalog:
     """模型目录 + 运行期校准覆盖。"""
-
     def __init__(self, models: Optional[List[ModelSpec]] = None) -> None:
-        self._models: Dict[str, ModelSpec] = {m.name: m for m in (models or _DEFAULT_MODELS)}
+        specs = list(models or _DEFAULT_MODELS)
+        _validate(specs)
+        self._models: Dict[str, ModelSpec] = {spec.name: spec for spec in specs}
         self._aliases: Dict[str, str] = {}
 
     # -- 查询 ---------------------------------------------------------------
@@ -190,21 +219,16 @@ class Catalog:
         return list(self._models.keys())
 
     def get(self, name: Optional[str]) -> ModelSpec:
-        from .errors import ParamInvalid
-
         if not name:
             name = DEFAULT_MODEL
         key = self._aliases.get(name.lower(), name)
         spec = self._models.get(key)
         if spec is None:
             # 允许直接传内部 req_key
-            for m in self._models.values():
-                if m.req_key == name:
-                    return m
-            raise ParamInvalid(
-                f"未知模型: {name}",
-                details={"available": self.names()},
-            )
+            for model in self._models.values():
+                if model.req_key == name:
+                    return model
+            raise ParamInvalid(f"未知模型: {name}", details={"available": self.names()})
         return spec
 
     def all(self) -> List[ModelSpec]:

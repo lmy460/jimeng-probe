@@ -15,7 +15,7 @@ IMAGE_URL_KEYS = ("url", "image_url", "download_url")
 
 def pick_history(payload: Any, history_id: str) -> Dict[str, Any]:
     """从 get_history_by_ids 的返回里挑出目标记录。"""
-    records = find_list(payload, ("history_list", "history_records", "list"))
+    records = history_records(payload)
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -23,6 +23,37 @@ def pick_history(payload: Any, history_id: str) -> Dict[str, Any]:
         if rid is None or str(rid) == str(history_id):
             return record
     return records[0] if records and isinstance(records[0], dict) else {}
+
+
+def history_records(payload: Any) -> List[Any]:
+    """history_list / history_records / list 三种键名的统一入口。"""
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if isinstance(data, dict):
+        for key in ("history_list", "history_records", "list"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        return [data]
+    return data if isinstance(data, list) else []
+
+
+def find_dict(obj: Any, key: str, depth: int = 0) -> Optional[Dict[str, Any]]:
+    """在嵌套结构里找第一个以 key 为名的 dict（用于 proof_info 这类包装层）。"""
+    if depth > 5:
+        return None
+    if isinstance(obj, dict):
+        value = obj.get(key)
+        if isinstance(value, dict):
+            return value
+        for child in obj.values():
+            found = find_dict(child, key, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_dict(item, key, depth + 1)
+            if found is not None:
+                return found
+    return None
 
 
 def extract_images(record: Any) -> List[Dict[str, Any]]:

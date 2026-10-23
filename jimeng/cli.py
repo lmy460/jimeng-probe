@@ -1,4 +1,4 @@
-"""命令行入口：python -m jimeng.cli <command>"""
+"""命令行入口：python -m jimeng <command>"""
 
 from __future__ import annotations
 
@@ -6,18 +6,19 @@ import argparse
 import json
 import os
 import sys
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .accounts import AccountPool, load_accounts
 from .catalog import Catalog
+from .client import JimengClient
 from .errors import JimengError
-from .probe import ProbeRunner
+from .payload import build_generate_body
+from .probe import ProbeRunner, static_matrix
 from .request import GenerateRequest, ReferenceImage
 
 
 def _pool() -> AccountPool:
-    accounts = load_accounts()
-    return AccountPool(accounts, catalog=Catalog.load())
+    return AccountPool(load_accounts(), catalog=Catalog.load())
 
 
 def _print(obj: Any) -> None:
@@ -39,26 +40,25 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 
 def cmd_credit(args: argparse.Namespace) -> int:
-    pool = AccountPool(load_accounts(), catalog=Catalog.load())
-    _print({"accounts": pool.refresh_all()})
+    _print({"accounts": _pool().refresh_all()})
     return 0
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
-    pool = AccountPool(load_accounts(), catalog=Catalog.load())
-    refs = [ReferenceImage(path=p) for p in (args.image or [])]
-    refs += [ReferenceImage(url=u) for u in (args.image_url or [])]
+    pool = _pool()
+    refs = [ReferenceImage(path=path) for path in (args.image or [])]
+    refs += [ReferenceImage(url=url) for url in (args.image_url or [])]
     req = GenerateRequest(
         prompt=args.prompt,
         model=args.model,
         negative_prompt=args.negative or "",
-        images=refs,
+        images=tuple(refs),
         ratio=args.ratio,
         resolution=args.resolution,
         n=args.n,
         seed=args.seed,
         sample_strength=args.strength,
-        intelligent_ratio=None if not args.auto_ratio else True,
+        intelligent_ratio=True if args.auto_ratio else None,
         dry_run=args.dry_run,
         wait=not args.no_wait,
         timeout_s=args.timeout,
@@ -77,26 +77,29 @@ def cmd_generate(args: argparse.Namespace) -> int:
         return 0
 
     if args.out and result.get("data"):
-        os.makedirs(args.out, exist_ok=True)
-        for item in result["data"]:
-            url = item.get("url")
-            if not url:
-                continue
-            resp = client.transport.request("GET", url, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status == 200:
-                path = os.path.join(args.out, f"{result['id']}_{item['index']:02d}.png")
-                with open(path, "wb") as fh:
-                    fh.write(resp.body)
-                item["saved_to"] = path
+        _save_images(client, result, args.out)
     _print(result)
     return 0 if result["status"] in ("succeeded", "submitted") else 1
 
 
-def cmd_probe(args: argparse.Namespace) -> int:
-    from .probe import static_matrix
+def _save_images(client: JimengClient, result: Dict[str, Any], out_dir: str) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    for item in result["data"]:
+        url = item.get("url")
+        if not url:
+            continue
+        resp = client.transport.request("GET", url, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status != 200:
+            item["save_error"] = f"HTTP {resp.status}"
+            continue
+        path = os.path.join(out_dir, f"{result['id']}_{item['index']:02d}.png")
+        with open(path, "wb") as fh:
+            fh.write(resp.body)
+        item["saved_to"] = path
 
+
+def cmd_probe(args: argparse.Namespace) -> int:
     if not args.live:
-        # 静态探测不需要凭证，随时可跑
         report = {
             "live": False,
             "findings": [static_matrix(Catalog.load(), args.model).to_dict()],
@@ -105,9 +108,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         _print(report)
         return 0
 
-    pool = AccountPool(load_accounts(), catalog=Catalog.load())
-    client = pool.client(args.account)
-    runner = ProbeRunner(client, max_credits=args.max_credits)
+    runner = ProbeRunner(_pool().client(args.account), max_credits=args.max_credits)
     report = runner.run(
         args.probes.split(",") if args.probes else None,
         model=args.model,
@@ -124,30 +125,27 @@ def cmd_probe(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     from .gateway import serve
 
-    pool = AccountPool(load_accounts(), catalog=Catalog.load())
-    serve(pool, host=args.host, port=args.port)
+    serve(_pool(), host=args.host, port=args.port)
     return 0
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:
     """零网络自检：编译一份报文并打印关键字段。"""
-    catalog = Catalog.load()
-    req = GenerateRequest(prompt="self test", model=args.model, ratio=args.ratio, resolution=args.resolution, n=args.n)
-    plan = req.normalize(catalog)
-    from .payload import build_generate_body
-
+    plan = GenerateRequest(
+        prompt="self test", model=args.model, ratio=args.ratio, resolution=args.resolution, n=args.n
+    ).normalize(Catalog.load())
     body = build_generate_body(plan)
     draft = json.loads(body["draft_content"]) if isinstance(body["draft_content"], str) else body["draft_content"]
-    core = draft["component_list"][0]["abilities"]["generate"]["core_param"]
+    generate = draft["component_list"][0]["abilities"]["generate"]
     _print(
         {
             "plan": plan.to_dict(),
             "payload": {
                 "root_model": body["extend"]["root_model"],
-                "image_ratio": core.get("image_ratio"),
-                "large_image_info": core["large_image_info"],
-                "generate_number": draft["component_list"][0]["abilities"]["generate"]["gen_option"]["generate_number"],
-                "prompt": core["prompt"],
+                "image_ratio": generate["core_param"].get("image_ratio"),
+                "large_image_info": generate["core_param"]["large_image_info"],
+                "generate_number": generate["gen_option"]["generate_number"],
+                "prompt": generate["core_param"]["prompt"],
             },
             "billing": {
                 "submissions": plan.submissions,
@@ -217,8 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = build_parser().parse_args(argv)
     try:
         return int(args.func(args) or 0)
     except JimengError as exc:

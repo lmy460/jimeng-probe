@@ -210,19 +210,19 @@ probe --live --write  →  calibration.json  →  Catalog.load()  →  confidenc
 
 ## 8. 代码结构与阅读路径
 
-| 顺序 | 文件 | 职责 | 行数 |
-|---|---|---|---|
-| 1 | `errors.py` | 12 类错误码与 HTTP 语义 | ~136 |
-| 2 | `catalog.py` | 模型 / 比例 / 分辨率目录 + 校准覆盖 | ~251 |
-| 3 | `request.py` | 参数校验 → `Plan`（含成本） | ~270 |
-| 4 | `payload.py` | `Plan` → `draft_content` | ~195 |
-| 5 | `credits.py` | 账本：预留 / 结算 / 日配额 | ~240 |
-| 6 | `client.py` | 上传 → 提交 → 轮询 → 结算 → 幂等 | ~430 |
-| 7 | `parsing.py` | 上游返回的容错解析 | ~150 |
-| 8 | `probe.py` | 静态 + 实测探测 | ~300 |
-| 9 | `gateway.py` | REST 网关（零依赖） | ~270 |
-| 10 | `accounts.py` | 多账号池 | ~100 |
-| 11 | `transport.py` / `sign.py` / `upload.py` | 传输 / 签名 / ImageX 上传 | ~400 |
+| 顺序 | 文件 | 职责 |
+|---|---|---|
+| 1 | `errors.py` | 12 类错误码与 HTTP 语义 |
+| 2 | `catalog.py` | 模型 / 比例 / 分辨率目录（启动校验 + 校准覆盖） |
+| 3 | `request.py` | 参数校验 → 不可变 `Plan`（含成本） |
+| 4 | `payload.py` | `Plan` → `draft_content` |
+| 5 | `credits.py` | 账本：预留 / 结算 / 日配额 / 流水 |
+| 6 | `client.py` | 上传 → 提交 → 轮询 → 结算 → 幂等 |
+| 7 | `parsing.py` | 上游返回的容错解析 |
+| 8 | `probe.py` | 静态 + 实测探测 |
+| 9 | `gateway.py` | REST 网关（表驱动路由，零依赖） |
+| 10 | `accounts.py` | 多账号池 |
+| 11 | `cache.py` / `transport.py` / `sign.py` / `upload.py` | 幂等缓存 / 传输 / 签名 / ImageX 上传 |
 
 **最短路径理解项目**：`request.py`（参数语义）→ `client.py::generate`（全流程）→ `credits.py`（钱怎么算）。
 
@@ -230,7 +230,9 @@ probe --live --write  →  calibration.json  →  Catalog.load()  →  confidenc
 
 ## 9. 测试策略
 
-`tests/test_offline.py`，23 项，全部基于 `FakeTransport`，不触网、不消耗积分：
+> 审查过程中发现并修复的 14 处问题（含 3 处资金安全类）记录在 [`REVIEW.md`](REVIEW.md)。
+
+`tests/test_offline.py`，27 项，全部基于 `FakeTransport`，不触网、不消耗积分：
 
 | 覆盖点 | 用例 |
 |---|---|
@@ -242,7 +244,8 @@ probe --live --write  →  calibration.json  →  Catalog.load()  →  confidenc
 | 图生图 | `generate_type=blend`、prompt 尾部 `##`、`image_uri` 落到 `ability_list` |
 | 解析容错 | camelCase / snake_case 余额、嵌套去重、通用兜底 |
 | 探测 | 静态 24 组合全通过；live 超预算即跳过 |
-| 网关 | 路由、dry-run、素材上传、幂等键 |
+| 网关 | 路由、dry-run、素材上传、幂等键、pending 回查 |
+| 可靠性与资金安全 | POST 不自动重试、缓存副本隔离、异常路径释放预留 |
 
 **刻意不 mock 的东西**：签名算法、报文嵌套层级、错误码映射。这些正是最容易错的部分，mock 掉就失去了测试价值。
 

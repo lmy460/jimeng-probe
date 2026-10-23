@@ -21,12 +21,13 @@ from jimeng.errors import (  # noqa: E402
     CapabilityUnsupported,
     CreditInsufficient,
     ParamInvalid,
+    RiskControl,
 )
 from jimeng.gateway import Gateway  # noqa: E402
 from jimeng.parsing import extract_images  # noqa: E402
 from jimeng.probe import ProbeRunner  # noqa: E402
 from jimeng.request import GenerateRequest, ReferenceImage  # noqa: E402
-from jimeng.transport import Response  # noqa: E402
+from jimeng.transport import Response, Transport  # noqa: E402
 from jimeng.accounts import AccountPool  # noqa: E402
 
 
@@ -39,11 +40,12 @@ class FakeTransport:
         self.width = width
         self.height = height
         self.history_status = 50
+        self.generate_ret = None
         self.calls = []
         self.bodies = []
         self.counter = 0
 
-    def request(self, method, url, *, headers=None, json_body=None, data=None, timeout=None):
+    def request(self, method, url, *, headers=None, json_body=None, data=None, timeout=None, retry=None):
         self.calls.append((method, url))
         if json_body is not None:
             self.bodies.append((url, json_body))
@@ -57,6 +59,8 @@ class FakeTransport:
         if "submit_audit_job" in url:
             return self._json({"ret": "0"})
         if "aigc_draft/generate" in url:
+            if self.generate_ret is not None:
+                return self._json({"ret": self.generate_ret[0], "errmsg": self.generate_ret[1]})
             self.counter += 1
             self.balance = max(0.0, self.balance - self.images_per_submit)
             return self._json({"ret": "0", "data": {"aigc_data": {"history_record_id": str(1000 + self.counter)}}})
@@ -148,6 +152,12 @@ class TestParamResolution(unittest.TestCase):
         with self.assertRaises(ParamInvalid):
             GenerateRequest(prompt="x", n=9).normalize(catalog)
 
+    def test_unknown_parameter_rejected(self):
+        with self.assertRaises(ParamInvalid):
+            GenerateRequest.from_dict({"prompt": "x", "resolution_type": "2k"})
+        with self.assertRaises(ParamInvalid):
+            GenerateRequest.from_dict({"prompt": "x", "images": [{"path": "a.png", "role_typo": "x"}]})
+
     def test_payload_structure(self):
         from jimeng.payload import build_generate_body
 
@@ -174,7 +184,7 @@ class TestGeneration(unittest.TestCase):
 
     def test_end_to_end_generation(self):
         client, fake = make_client(balance=40.0)
-        result = client.generate(GenerateRequest(prompt="cat", model="jimeng-4.5", n=1, timeout_s=10, poll_interval_s=0.01))
+        result = client.generate(GenerateRequest(prompt="cat", model="jimeng-4.5", n=1, timeout_s=10, poll_interval_s=0.5))
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(len(result["data"]), 4)
         self.assertEqual(result["usage"]["credits_charged"], 4.0)
@@ -192,7 +202,7 @@ class TestGeneration(unittest.TestCase):
     def test_timeout_settles_conservatively(self):
         client, fake = make_client(balance=40.0)
         fake.history_status = 20
-        result = client.generate(GenerateRequest(prompt="cat", timeout_s=0.01, poll_interval_s=0.01))
+        result = client.generate(GenerateRequest(prompt="cat", timeout_s=1, poll_interval_s=0.5))
         self.assertEqual(result["status"], "timeout")
         self.assertEqual(result["usage"]["credits_charged"], 4.0)
         self.assertEqual(result["pending"], ["1001"])
@@ -200,10 +210,10 @@ class TestGeneration(unittest.TestCase):
 
     def test_idempotent_cache_avoids_double_spend(self):
         client, fake = make_client()
-        req = GenerateRequest(prompt="cat", idempotency_key="order-1", timeout_s=10, poll_interval_s=0.01)
+        req = GenerateRequest(prompt="cat", idempotency_key="order-1", timeout_s=10, poll_interval_s=0.5)
         first = client.generate(req)
         submits_after_first = sum(1 for _, url in fake.calls if "aigc_draft" in url)
-        second = client.generate(GenerateRequest(prompt="cat", idempotency_key="order-1", timeout_s=10, poll_interval_s=0.01))
+        second = client.generate(GenerateRequest(prompt="cat", idempotency_key="order-1", timeout_s=10, poll_interval_s=0.5))
         submits_after_second = sum(1 for _, url in fake.calls if "aigc_draft" in url)
         self.assertEqual(submits_after_first, 1)
         self.assertEqual(submits_after_second, 1)
@@ -235,7 +245,7 @@ class TestGeneration(unittest.TestCase):
             model="jimeng-3.0",
             images=[ReferenceImage(base64="data:image/png;base64," + base64.b64encode(b"fake").decode())],
             timeout_s=10,
-            poll_interval_s=0.01,
+            poll_interval_s=0.5,
         )
         result = client.generate(req)
         body = [b for u, b in fake.bodies if "aigc_draft" in u][0]
@@ -246,6 +256,37 @@ class TestGeneration(unittest.TestCase):
         self.assertTrue(core["prompt"].endswith("##"))
         self.assertEqual(component["abilities"]["blend"]["ability_list"][0]["image_uri_list"], ["tos-cn-i-test/abc"])
         self.assertEqual(result["request"]["mode"], "img2img")
+
+
+    def test_cache_returns_isolated_copies(self):
+        client, _ = make_client()
+        req = GenerateRequest(prompt="cat", idempotency_key="k-copy", timeout_s=10, poll_interval_s=0.5)
+        first = client.generate(req)
+        first["usage"]["credits_charged"] = 999
+        first["data"].clear()
+        second = client.generate(req)
+        self.assertTrue(second["cached"])
+        self.assertEqual(second["usage"]["credits_charged"], 0.0)
+        self.assertEqual(len(second["data"]), 4)
+
+    def test_reservation_released_when_submit_rejected(self):
+        client, fake = make_client()
+        fake.generate_ret = ("4013", "疑似异常行为")
+        with self.assertRaises(RiskControl):
+            client.generate(GenerateRequest(prompt="cat", timeout_s=5))
+        usage = client.account.ledger.usage()
+        self.assertEqual(usage["reserved"], 0.0)
+        self.assertEqual(usage["open_reservations"], 0)
+        self.assertEqual(usage["spent_today"], 0.0)
+
+
+class TestTransportPolicy(unittest.TestCase):
+    def test_post_never_retries_by_default(self):
+        transport = Transport(retries=3)
+        self.assertEqual(transport.attempts_for("POST"), 0)
+        self.assertEqual(transport.attempts_for("GET"), 3)
+        self.assertEqual(transport.attempts_for("POST", 1), 1)
+        self.assertEqual(transport.attempts_for("POST", 0), 0)
 
 
 class TestParsing(unittest.TestCase):
@@ -326,7 +367,7 @@ class TestProbeAndGateway(unittest.TestCase):
         fake = FakeTransport(balance=40.0)
         pool = AccountPool([Account(id="gw", sessionid="sid", cooldown_s=0.0)], transport=fake, catalog=Catalog.load())
         gw = Gateway(pool)
-        payload = {"prompt": "cat", "idempotency_key": "k1", "timeout_s": 10, "poll_interval_s": 0.01}
+        payload = {"prompt": "cat", "idempotency_key": "k1", "timeout_s": 10, "poll_interval_s": 0.5}
         status, first = gw.handle("POST", "/v1/images/generations", json.dumps(payload).encode(), "application/json")
         self.assertEqual(status, 200)
         status, second = gw.handle("POST", "/v1/images/generations", json.dumps(payload).encode(), "application/json")
