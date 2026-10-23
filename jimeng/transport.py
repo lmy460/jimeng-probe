@@ -1,9 +1,7 @@
-"""HTTP 传输层：urllib 实现，零第三方依赖。
+"""HTTP 传输层，基于 urllib，无第三方依赖。
 
-重试策略是这一层最重要的设计：
-  - 只有**幂等**请求（GET/HEAD）默认重试；
-  - POST 默认不重试，必须由调用方显式声明 `retry=n`。
-    原因很直接：`aigc_draft/generate` 一旦被重放就是二次扣积分，这是资损，不是"偶发失败"。
+重试按方法区分：GET/HEAD 默认重试，POST 默认零重试，需要时由调用方传 retry。
+`aigc_draft/generate` 是非幂等 POST，重放会重复提交并再次扣费。
 """
 
 from __future__ import annotations

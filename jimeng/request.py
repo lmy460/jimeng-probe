@@ -7,8 +7,7 @@
 3. 4.x 模型一次提交固定产出 4 张（系列组图），所以 n 是最小计费粒度的倍数。
 4. 图生图时 prompt 末尾必须补 2 个 '#'/图，这是网页端的隐式约定。
 
-`Plan` 是不可变值对象：需要补充已解析的参考图 URI 时用 `with_references()` 派生新实例，
-而不是原地改字段——后者会让"提交用的 plan"和"响应回显的 plan"悄悄不一致。
+`Plan` 不可变。补充参考图 URI 时用 `with_references()` 返回新实例，避免提交和回显用到两份数据。
 """
 
 from __future__ import annotations

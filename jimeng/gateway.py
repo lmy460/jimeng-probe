@@ -37,7 +37,7 @@ HandlerFn = Callable[..., Tuple[int, Dict[str, Any]]]
 
 
 class TaskStore:
-    """网关的任务表。只在内存里，重启即失效——这是刻意的最小实现。"""
+    """网关的任务表，只在内存里，重启后失效。"""
 
     def __init__(self, max_items: int = 2000) -> None:
         self._lock = threading.Lock()

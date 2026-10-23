@@ -181,7 +181,7 @@ DEFAULT_MODEL = "jimeng-4.5"
 
 
 def _validate(specs: List[ModelSpec]) -> None:
-    """目录是手写常量，容易写错；宁可启动即失败，也不要线上才发现码值不存在。"""
+    """目录是手写常量，启动时检查一遍，写错直接报错。"""
     seen = set()
     for spec in specs:
         if spec.name in seen:

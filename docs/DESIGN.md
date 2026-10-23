@@ -1,284 +1,223 @@
-# 项目说明：即梦网页端的探测与复用
+# 即梦网页版接口封装
 
-> 接口字段见 [`API.md`](API.md)。本文说明设计取舍，以及探测过程中确认的、需要写进代码里的规则。
+把 `jimeng.jianying.com` 的出图流程封装成可调用的 SDK 和 HTTP 接口。
+接口字段见 [`API.md`](API.md)，这里记录设计上的取舍，以及实测确认、必须写进代码的行为。
 
----
+## 背景
 
-## 1. 项目解决什么问题
+网页版每天有 66 积分，一次 4.x 生成消耗 4 分；请求体是嵌套很深的 `draft_content`，参数语义和界面上的说法并不一致。
+直接照着抓包发请求能跑通，但很难安全地复用：并发、重试、失败退款都会影响额度。
 
-即梦网页版能免费出图，但有三个结构性障碍：
+项目提供四部分：
 
-| 障碍 | 具体表现 | 本项目的应对 |
-|---|---|---|
-| **额度稀缺** | 每日 66 积分，一次 4.x 生成就吃 4 分 | 预算闸门 + 预留结算 + 幂等缓存，杜绝重复扣费 |
-| **不可编程** | 只能点网页，请求体是深度嵌套的 `draft_content` | 把嵌套结构编译成 `Plan`，对外只暴露 8 个业务参数 |
-| **语义隐晦** | 张数、分辨率、比例的行为与直觉不符 | 探测模块把"猜测"变成"可验证事实"，并写入校准文件 |
+- `JimengClient`：进程内调用，负责一次生成的完整流程。
+- HTTP 网关：`/v1/images/generations` 等接口，供其他进程或语言使用。
+- 探测命令：校验参数组合，实测张数与单价。
+- `calibration.json`：探测结果，启动时覆盖目录里的默认值。
 
-交付物是四件东西：
+## 网页操作与参数的对应关系
 
-1. **SDK**：`JimengClient.generate(GenerateRequest)`，进程内直接用；
-2. **网关**：`/v1/images/generations` 等 REST 接口，供其它语言/服务复用；
-3. **探测器**：`probe`，零消耗静态校验 + 受预算约束的实测校准；
-4. **校准数据**：`calibration.json`，让"目录推测值"升级为"本机实测值"。
-
----
-
-## 2. 五类网页操作 → API 参数的映射
-
-| 网页动作 | API 参数 | 落到上游的位置 | 容易踩的坑 |
+| 网页动作 | 接口参数 | 上游字段 | 备注 |
 |---|---|---|---|
-| 附加图片 | `images[]`（≤10） | `component.abilities.blend.ability_list[].image_uri_list` + `prompt_placeholder_info_list` | 必须先上传拿 `image_uri` 并过审核；prompt 末尾要补 `#`；组件类型从 `generate` 变 `blend` |
-| 选择模型 | `model` | `extend.root_model` 与 `core_param.model` 双写 | 两处必须一致；用户侧名字与内部 `req_key` 不同（`jimeng-4.6` ↔ `high_aes_general_v42`） |
-| 图片比例 | `ratio` | `core_param.image_ratio`（枚举码） | 传字符串无效；`1:1` 是 `8`；`auto` 时必须**省略**该字段 |
-| 分辨率 | `resolution` | `core_param.large_image_info.{width,height,resolution_type}` | 三字段要成套；档位≠最终像素 |
-| 生成张数 | `n` | `gen_option.generate_number` + `metrics_extra.generateCount` | 4.x 上不决定张数，只决定**提交次数** |
+| 附加图片 | `images[]`，最多 10 张 | `component.abilities.blend.ability_list[].image_uri_list`、`prompt_placeholder_info_list` | 需要先上传取得 `image_uri` 并通过审核；prompt 末尾补 `#`；组件类型改为 `blend` |
+| 选择模型 | `model` | `extend.root_model` 与 `core_param.model` | 两处要一致；对外名称和内部 key 不同，例如 `jimeng-4.6` 对应 `high_aes_general_v42` |
+| 图片比例 | `ratio` | `core_param.image_ratio` | 上游要枚举码，不接受字符串；`1:1` 的值是 8 |
+| 分辨率 | `resolution` | `core_param.large_image_info` 的三个字段 | 宽、高、档位要成套；档位不等于最终像素 |
+| 生成张数 | `n` | `gen_option.generate_number`、`metrics_extra.generateCount` | 4.x 上不控制张数，只控制提交次数 |
 
-这张表是接口设计的全部依据：**对外一个语义参数，对内可能落三四个字段**，且每个字段都有独立的失败模式。把这些收敛在 `payload.py` 一个文件里，是这套封装最主要的工程价值。
+对外是一个参数，落到上游往往三四个字段，而且失败方式各不相同。
+这些转换集中在 `payload.py`，其他模块只处理业务参数。
 
----
+## 实测确认的行为
 
-## 3. 探测得到的规则
+以下结论来自抓包报文和本机提交结果，未验证的条目在最后一节单独列出。
 
-证据等级：**A** = 多来源一致或本机可复现；**B** = 单一来源/间接推断；**C** = 未验证假设。
+### 生成张数由模型决定
 
-### R1　张数不是自由变量（等级 A）
-
-**现象**：`jimeng-4.6`、`16:9`、`1k`，`generateCount=1`，返回 **4 张** PNG。
-**机制**：4.x 是"系列组图"模型，一次提交固定产出 4 张；`n` 只影响提交次数，不影响单次产出。
-
-**推论**：
+`jimeng-4.6`、`16:9`、`1k`，提交时 `generateCount=1`，返回 4 张 PNG。
+4.x 属于系列组图模型，一次提交固定出 4 张，`n` 只影响提交次数：
 
 ```
-K = outputs_per_submit         # 3.x → 1，4.x → 4
+K = 单次产出张数      # 3.x 为 1，4.x 为 4
 submissions = ceil(n / K)
-实际张数 = submissions × K ≥ n
-成本 = submissions × K × 单价
+实得张数 = submissions * K
+花费 = submissions * K * 单价
 ```
 
-| 需求 | 模型 | 提交次数 | 实得张数 | 花费 |
+| 需求 | 模型 | 提交次数 | 实得 | 花费 |
 |---|---|---|---|---|
 | 1 张 | jimeng-3.0 | 1 | 1 | 1 |
-| 1 张 | jimeng-4.6 | 1 | **4** | **4** |
+| 1 张 | jimeng-4.6 | 1 | 4 | 4 |
 | 4 张 | jimeng-4.6 | 1 | 4 | 4 |
 | 4 张 | jimeng-3.0 | 4 | 4 | 4 |
 
-**处置**：`Plan.submissions` 与 `Plan.planned_images` 分离；`usage` 同时回报 `images_requested` 与 `images_returned`；降级时优先降分辨率/换 3.x，**而不是减 `n`**（4.x 上减 `n` 不省钱）。
+要控制成本只能换 3.x 或降低分辨率。在 4.x 上把 `n` 调小不会减少花费。
 
-> 这条规则决定成本公式，也决定了哪些调用方式其实并不省钱。
+代码里 `Plan.submissions` 和 `Plan.planned_images` 分开记录，响应的 `usage` 同时给出请求张数和实际张数。
 
-### R2　分辨率是档位提示，不是像素承诺（等级 A）
+### 分辨率只是档位提示
 
-**现象**：`1k + 16:9` 提交 `1024×576`，产物 `1280×720`。
-**机制**：提交尺寸只是给服务端的构图提示，最终像素由模型侧归一化（同一比例下统一长边）。
+`1k` 加 `16:9` 提交的尺寸是 `1024x576`，产物是 `1280x720`。服务端会按比例归一化长边。
 
-**处置**：`data[].width/height` 是唯一可信尺寸；不要基于请求参数做裁剪、拼图、标注等后处理假设。响应里 `request.submit_size` 与 `data[].width/height` 并列返回，差异一目了然。
+产物尺寸以响应里的 `data[].width/height` 为准，不要用请求参数推算。`request.submit_size` 和产物尺寸都放在响应里，方便对照。
 
-### R3　比例是枚举码，且 `1:1` 不连续（等级 A）
+### 比例使用枚举码
 
 `21:9=0, 16:9=1, 3:2=2, 4:3=3, 3:4=4, 2:3=5, 9:16=6, 1:1=8`。
 
-按顺序类推写成 `1:1=7` 会直接失败。代码里以字典为准，且 `static` 探测会逐个校验"码值 ↔ 提交尺寸"是否自洽。
+`1:1` 是 8 而不是 7，按顺序类推会失败。`ratio=auto` 只支持 4.0 及以上，且必须省略 `image_ratio` 字段，传了反而会固定比例。
 
-`ratio=auto`（智能比例）只在 4.0+ 生效，且必须**省略** `image_ratio` 字段——传了反而会锁死比例。
+### 图生图有三个前置条件
 
-### R4　图生图的三个前置条件（等级 A/B）
+1. 参考图走 `get_upload_image_proof`、ImageX 上传、`submit_audit_job` 三步，取得 `image_uri`。
+2. prompt 末尾按图片数量补 `2 * N` 个 `#`，一张是 `##`，两张是 `####`。
+3. 组件 `generate_type` 改成 `blend`，同时补 `ability_list` 和 `prompt_placeholder_info_list`。
 
-1. 参考图必须先走 `get_upload_image_proof → ImageX 上传 → submit_audit_job`；
-2. `prompt` 末尾按图数补 `2×N` 个 `#`（1 张 `##`，2 张 `####`）；
-3. 组件 `generate_type` 切 `blend`，并补 `ability_list` 与 `prompt_placeholder_info_list`（逐图 `ability_index`）。
+审核不通过时参考图不可用。曾遇到 `ret=3020 download file failed`，是 CDN 尚未就绪，等待后重试可以恢复。
 
-审核环节是硬门槛：未过审的图不能当参考图（见过 `ret=3020 download file failed`，CDN 未就绪，重试可恢复，等级 B）。
+### 同一账号不能并发
 
-### R5　同账号并发是红线（等级 A）
+- 请求缺少浏览器签名时可能被判风控：`ret=4013`，`fail_starling_key=web_risk_control_message_reject_generation`。
+- 并发超过限制：`ret=1310 exceed_model_parallel_max`。
 
-- 不带浏览器签名的请求可能直接被判风控：`ret=4013`、`fail_starling_key=web_risk_control_message_reject_generation`；
-- 并发超限：`ret=1310 exceed_model_parallel_max`。
+代码里每个账号一把非阻塞锁，拿不到直接返回 `ACCOUNT_BUSY`，不排队；请求之间默认间隔 3 秒。
+风控类错误不重试。
 
-**处置**：每账号一把非阻塞锁（拿不到就返回 `ACCOUNT_BUSY`，不排队堆积）+ 默认 3s 最小间隔；`RISK_CONTROL` **不重试**（重试等于加重标记）。
+视频生成需要浏览器的 `msToken` 和 `a_bogus`，纯接口调用会被 4013 拦下，所以这个项目只做图像，不引入浏览器自动化。
 
-**能力边界**：视频生成在不复现浏览器 `msToken`/`a_bogus` 的情况下会被 4013 拦下。本项目因此**只做图像**，不引入浏览器自动化——那是另一套登录态与指纹问题，会显著放大维护成本。
+### 扣费发生在提交阶段
 
-### R6　积分在提交时扣除，退款不确定（等级 B）
+余额差显示扣费在提交和生成阶段，不在下载阶段。失败是否退还、多久退还，上游没有明确约定。
 
-余额差观测显示扣费发生在提交/生成阶段，而非下载时。失败是否退还、何时退还，上游没有契约。
+处理方式：
 
-**处置**：
-- 提交前 `reserve(estimate)`，禁止并发超支；
-- 结算以"提交前后余额差"为准（`update_balance=False`，避免二次扣减）；
-- 明确的失败（`status=30`）按 0 结算并记录事件；**超时按预估计费**（保守），同时返回 `pending: [history_id]` 供人工复核。
+- 提交前按预估值 `reserve`，防止并发超支；
+- 结算用提交前后的余额差，此时不再做本地扣减，避免重复记账（`settle(balance_is_fresh=True)`）；
+- 确定失败（`status=30`）按 0 结算并记录流水；
+- 超时按预估计费，响应里带 `pending`，可以用 `history_id` 事后核对。
 
-### R7　状态码有三套语义并存（等级 A/B）
+### 历史状态码有三套
 
-`20` 进行中、`30` 失败、`40` 成功（旧版）、`50` 成功（新版常见）、`21` 完成（更早版本）。
-另有业务码 `2038`（内容审核拦截）。
+`20` 进行中，`30` 失败，`40` 成功，`50` 成功，`21` 完成。早期版本和当前版本的取值不同。
+另外 `2038` 表示内容审核拦截。
 
-**处置**：成功集合取 `{21,40,50}`，失败取 `{30}`，其余视为进行中；同时"有图且状态不在进行中"也判成功——避免新版状态码导致空转。
+代码把 `{21, 40, 50}` 视为成功，`{30}` 视为失败，其余按进行中处理；有产物且状态不在进行中时也判成功，避免状态码变更导致一直轮询。
 
-### R8　免费额度与多账号（等级 B）
+### 额度按账号计算
 
-每日 66 积分（中国站口径），按自然日滚动；多账号额度独立、不合并。
-账本按账号隔离，`GET /v1/credit` 逐账号回报，选择账号时"可用余额最多者优先"而非轮询。
+每日 66 积分，按北京时间自然日重置。多账号额度独立，不合并。
+账本按账号隔离，`GET /v1/credit` 逐个返回；选择账号时取可用余额最多的一个。
 
-### R9　4k 单价未验证（等级 C）
+4k 单价目前是推测值（2 积分/张），目录里标记为 `default`，跑一次成本探测可以校准。
 
-目录默认 `1k/2k = 1 积分/张`、`4k = 2 积分/张`。4k 这一项是推测，`confidence=default`。
-验证方式：`probe --live --probes cost --resolutions 4k --write`。
-
----
-
-## 4. 架构：为什么这样分层
+## 成本计算
 
 ```
-GenerateRequest ──校验──▶ Plan ──编译──▶ draft_content ──提交──▶ history_id
-                            │                                      │
-                            ├── 成本（credits/单价/张数）            ├── 轮询
-                            └── 审计（request 原样回显）             └── 产物 URL
+cost = ceil(n / K) * K * u(model, resolution)
 ```
 
-**`Plan` 是唯一真相源**。校验规则、成本预估、报文构造、响应回显全部从同一个 `Plan` 派生。
-这消除了这类项目最常见的缺陷：预估算一套、提交算另一套，最后账对不上。
+`K` 是单次产出张数，`u` 是单位积分，默认 1k 和 2k 为 1，4k 为 2。
 
-三条不可绕过的链路：
+| 场景 | 参数 | 预估积分 |
+|---|---|---|
+| 调试 | `3.0 / 1k / 1:1 / n=1` | 1 |
+| 常规 | `4.6 / 2k / 16:9 / n=4` | 4 |
+| 高清 | `4.5 / 4k / 16:9 / n=4` | 8 |
+| 批量 12 张 | `4.6 / 2k / n=4` 提交 3 次 | 12 |
 
-1. **成本链路**：`Plan.estimated_credits → reserve → settle(余额差)`；
-2. **幂等链路**：`cache_fingerprint → 命中则返回缓存（charged=0）`；
-3. **失败链路**：`TaskFailed/RiskControl → 退款且抛错`；`TaskTimeout → 保守计费且返回 pending`。
-
----
-
-## 5. 成本模型
+## 结构
 
 ```
-cost = ceil(n / K) × K × u(model, resolution)
+GenerateRequest --校验--> Plan --编译--> draft_content --提交--> history_id
+                            |                                      |
+                            +-- 成本估算                            +-- 轮询
+                            +-- 响应回显                            +-- 产物 URL
 ```
 
-- `K`：单次产出张数，3.x=1，4.x=4；
-- `u`：单位积分，默认 1k/2k=1.0，4k=2.0（待实测）。
+`Plan` 由校验结果一次算出，成本、报文、响应都从它取，避免预估和提交各算一套。
 
-典型场景（按默认单价）：
+三条主要路径：
 
-| 场景 | 参数 | 预估积分 | 备注 |
-|---|---|---|---|
-| 快速验证 | `3.0 / 1k / 1:1 / n=1` | 1 | 最省，适合探测与调试 |
-| 常规出图 | `4.6 / 2k / 16:9 / n=4` | 4 | 一次提交，4 张 |
-| 高清 | `4.5 / 4k / 16:9 / n=4` | 8 | 单价翻倍（待验证） |
-| 批量 12 张 | `4.6 / 2k / n=4` ×3 次 | 12 | 必须拆 3 次提交，串行 |
+1. 成本：`Plan.estimated_credits` → `reserve` → `settle`（余额差）。
+2. 幂等：`cache_fingerprint` 命中后直接返回缓存，不再提交，`credits_charged` 为 0。
+3. 失败：`TaskFailed`、`RiskControl` 等按 0 结算并抛出；`TaskTimeout` 按预估计费，返回 `pending`。
 
-**反例（常见误判）**：想"只要 1 张、省点额度"，在 4.6 上设 `n=1`——实际仍出 4 张、扣 4 分。正确做法是换 `3.0`，或接受 4 张。
-
----
-
-## 6. 预算与风控约束（写死在代码里）
+## 限制
 
 | 约束 | 默认值 | 位置 |
 |---|---|---|
-| 单账号并发 | 1（非阻塞锁） | `Account.lock` |
-| 最小请求间隔 | 3s | `Account.cooldown_s` / `JIMENG_COOLDOWN_S` |
-| 单次积分上限 | 未设（生产必须设） | `max_credits` / `JIMENG_MAX_CREDITS_PER_REQUEST` |
-| 日配额 | 66 | `Ledger.daily_quota` / `JIMENG_DAILY_QUOTA` |
-| 参考图上限 | 10 张 | `ModelSpec.max_reference_images` |
+| 单账号并发 | 1 | `Account.lock` |
+| 请求间隔 | 3 秒 | `Account.cooldown_s`、`JIMENG_COOLDOWN_S` |
+| 单次积分上限 | 不限制 | `max_credits`、`JIMENG_MAX_CREDITS_PER_REQUEST` |
+| 每日额度 | 66 | `Ledger.daily_quota`、`JIMENG_DAILY_QUOTA` |
+| 参考图数量 | 10 | `ModelSpec.max_reference_images` |
 | `n` 上限 | 4 | `MAX_N` |
-| 重试策略 | 仅网络/5xx，指数退避 | `Transport.retries` |
+| 重试 | 见 `transport.py` | `Transport.retries` |
 
-风控错误一律**不重试**：`RISK_CONTROL(4013)`、`CONTENT_FILTERED(2038)`。
-可重试：`RATE_LIMITED`、`ACCOUNT_BUSY`、`TASK_TIMEOUT`（且超时前应先查 `history_id`）。
+`RISK_CONTROL`（4013）和 `CONTENT_FILTERED`（2038）不重试。`RATE_LIMITED`、`ACCOUNT_BUSY` 可以退避重试；`TASK_TIMEOUT` 重提前应先查 `history_id`。
 
----
+## 探测
 
-## 7. 探测方法论
+`static` 不消耗额度，把目录里每个模型、比例、分辨率的组合编译一遍，校验码值和尺寸是否与目录一致。
 
-**两级探测，先免费后付费：**
+`live` 会真实提交，顺序是 `count`、`ratio`、`resolution`、`cost`。先测张数是因为它决定成本公式里的 `K`；成本放最后，因为要读提交前后的余额差，前面的探测会改变余额基线。
 
-1. `static`（0 消耗）：把目录里每个 `模型 × 比例 × 分辨率` 编译一遍，校验码值与尺寸自洽；
-2. `live`（受预算约束）：按 `count → ratio → resolution → cost` 顺序，逐步把推测变成实测。
+每次提交前检查 `spend + estimate` 是否超过 `max_credits`，超过就跳过并记为 `skipped`。
 
-**为什么先测 `count`**：它决定成本公式的分母，测错会让后续所有预算判断失真。
-**为什么 `cost` 放最后**：需要"提交前后余额差"，前面的 live 探测会污染余额基线。
+探测结果写到 `calibration.json`，`Catalog.load()` 启动时读取，只覆盖 `outputs_per_submit`、`credits_per_image`、`resolutions` 三个字段，避免一次异常探测改坏能力目录。
 
-**预算闸门**：每次 live 提交前检查 `spend + estimate > max_credits`，超出即标 `skipped`，绝不"试探性超支"。
+## 代码组织
 
-**校准闭环**：
-
-```
-probe --live --write  →  calibration.json  →  Catalog.load()  →  confidence=calibrated
-```
-
-校准只覆盖三类字段：`outputs_per_submit`、`credits_per_image`、`resolutions`。其余能力声明保持静态，避免"一次异常探测把能力目录改坏"。
-
----
-
-## 8. 代码结构与阅读路径
-
-| 顺序 | 文件 | 职责 |
-|---|---|---|
-| 1 | `errors.py` | 12 类错误码与 HTTP 语义 |
-| 2 | `catalog.py` | 模型 / 比例 / 分辨率目录（启动校验 + 校准覆盖） |
-| 3 | `request.py` | 参数校验 → 不可变 `Plan`（含成本） |
-| 4 | `payload.py` | `Plan` → `draft_content` |
-| 5 | `credits.py` | 账本：预留 / 结算 / 日配额 / 流水 |
-| 6 | `client.py` | 上传 → 提交 → 轮询 → 结算 → 幂等 |
-| 7 | `parsing.py` | 上游返回的容错解析 |
-| 8 | `probe.py` | 静态 + 实测探测 |
-| 9 | `gateway.py` | REST 网关（表驱动路由，零依赖） |
-| 10 | `accounts.py` | 多账号池 |
-| 11 | `cache.py` / `transport.py` / `sign.py` / `upload.py` | 幂等缓存 / 传输 / 签名 / ImageX 上传 |
-
-**最短路径理解项目**：`request.py`（参数语义）→ `client.py::generate`（全流程）→ `credits.py`（钱怎么算）。
-
----
-
-## 9. 测试策略
-
-> 已知缺陷与处理方式见 [`REVIEW.md`](REVIEW.md)。
-
-`tests/test_offline.py`，27 项，全部基于 `FakeTransport`，不触网、不消耗积分：
-
-| 覆盖点 | 用例 |
+| 文件 | 职责 |
 |---|---|
-| 报文正确性 | 比例码、提交尺寸、`generate_number`、`root_model` |
-| 成本语义 | 最小计费粒度（n=1/2/4/5）、3.x 与 4.x 差异 |
-| 能力拦截 | 3.x 不支持 4k / 不支持 `auto`；prompt 为空；n 越界 |
-| 资金安全 | `max_credits` 拦截在提交前（断言 0 次调用）、日配额、余额不足 |
-| 幂等 | 第二次请求 `cached=true`、`charged=0`、提交次数不增 |
-| 图生图 | `generate_type=blend`、prompt 尾部 `##`、`image_uri` 落到 `ability_list` |
-| 解析容错 | camelCase / snake_case 余额、嵌套去重、通用兜底 |
-| 探测 | 静态 24 组合全通过；live 超预算即跳过 |
-| 网关 | 路由、dry-run、素材上传、幂等键、pending 回查 |
-| 可靠性与资金安全 | POST 不自动重试、缓存副本隔离、异常路径释放预留 |
+| `errors.py` | 错误码与 HTTP 状态 |
+| `catalog.py` | 模型、比例、分辨率目录，启动时校验 |
+| `request.py` | 参数校验，生成不可变 `Plan` |
+| `payload.py` | `Plan` 转 `draft_content` |
+| `credits.py` | 账本，预留、结算、配额、流水 |
+| `client.py` | 上传、提交、轮询、结算 |
+| `parsing.py` | 上游返回的容错解析 |
+| `probe.py` | 静态与实测探测 |
+| `gateway.py` | HTTP 网关 |
+| `accounts.py` | 多账号池 |
+| `cache.py` | 幂等结果缓存 |
+| `transport.py` | HTTP 请求与重试 |
+| `sign.py` | 签名头与设备信息 |
+| `upload.py` | 参考图上传 |
 
-**刻意不 mock 的东西**：签名算法、报文嵌套层级、错误码映射。这些正是最容易错的部分，mock 掉就失去了测试价值。
+阅读顺序建议：`request.py` 看参数语义，`client.py` 的 `generate` 看整体流程，`credits.py` 看额度怎么算。
 
----
+## 测试
 
-## 10. 已知未知
+`tests/test_offline.py` 有 27 个用例，使用假的 transport，不联网也不消耗额度。
 
-| 项 | 状态 | 验证方式 |
+覆盖参数校验、计费粒度、能力拦截、预算与配额、幂等缓存、图生图报文、余额与历史解析、探测预算、网关路由，以及几个回归用例（POST 不重试、缓存副本隔离、异常释放预留）。
+
+签名算法、报文嵌套层级、错误码映射没有 mock，这几处最容易出错，mock 掉就测不到问题。
+
+## 未确认
+
+| 项 | 现状 | 确认方式 |
 |---|---|---|
-| 4k 单价是否 2 积分 | 推测（C） | `probe --live --probes cost --resolutions 4k --write` |
-| 每日 66 分的发放时点 | 未确认（C） | 连续两日 `GET /v1/credit` 对比 |
-| 失败是否退还积分 | 不确定（B） | 失败样本前后余额对比 |
-| 风控触发阈值（频率/并发） | 未量化 | 不建议主动试探 |
-| 国际站（dreamina）差异 | 未实现 | 需替换 host / `req_key` / `assistant_id` |
-| 视频生成 | 不做 | 需要浏览器 `msToken`/`a_bogus`，超出本项目边界 |
+| 4k 单价 | 推测 2 积分 | `probe --live --probes cost --resolutions 4k --write` |
+| 66 积分的发放时点 | 未确认 | 连续两天 `GET /v1/credit` 对比 |
+| 失败是否退还 | 未确认 | 失败前后余额对比 |
+| 风控触发阈值 | 未测 | 不建议主动试探 |
+| 国际站差异 | 未实现 | 需替换 host、`req_key`、`assistant_id` |
+| 视频生成 | 不做 | 需要浏览器签名 |
 
----
+## 使用限制
 
-## 11. 合规与风险
+网页端接口不是公开 API，自动化调用通常不符合平台用户协议，账号可能被限流、清空额度或封禁。
+每日赠送的积分属于个人账号，不要转售，也不要包装成付费服务。
 
-1. **协议风险**：网页端接口非公开 API，自动化调用通常违反平台用户协议，可能导致限流、清空额度或封号。
-2. **额度属性**：每日赠送积分是个人账号权益，**不得转售**或作为付费服务交付第三方。
-3. **内容合规**：生成内容需符合平台规范；`2038` 是审核拦截，不应通过改词绕过。
-4. **工程默认**：网关只监听 `127.0.0.1`；sessionid 不出现在请求/响应/日志中；生产复用必须加 `JIMENG_GATEWAY_TOKEN` 与调用审计。
+网关默认只监听 `127.0.0.1`，sessionid 不会出现在请求、响应和日志里。对外提供服务时需要设置 `JIMENG_GATEWAY_TOKEN`。
 
-本项目定位为**个人额度内的能力研究与工程验证**，不提供绕过付费、批量注册或多账号刷量能力。
+## 后续
 
----
-
-## 12. 路线图
-
-- [ ] SQLite 账本（当前内存态，进程重启丢流水）
-- [ ] 异步任务持久化 + 崩溃恢复（当前 `wait=false` 的任务表在内存）
-- [ ] `GET /v1/usage` 审计视图（按调用方/模型/日聚合）
-- [ ] OpenAI 兼容层（`/v1/images/generations` 已同形，补 `b64_json` 与错误映射即可）
-- [ ] 国际站适配（host / `req_key` / `assistant_id` 三处差异）
-- [ ] 成本对账命令（拉 `history_ids` 复核超时任务的真实扣费）
+- 账本落 SQLite，现在只在内存里。
+- 任务表持久化，`wait=false` 的任务重启后会丢。
+- `GET /v1/usage`，按调用方和模型统计消耗。
+- 补 OpenAI 兼容层的错误映射。
+- 国际站适配。
+- 超时任务的对账命令，用 `history_id` 查实际扣费。

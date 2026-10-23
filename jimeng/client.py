@@ -1,12 +1,12 @@
-"""客户端：把一次"生成"拆成 上传 → 提交 → 轮询 → 结算 的可审计流程。
+"""客户端：一次生成的完整流程，包含上传、提交、轮询和结算。
 
-并发与资金安全在这里落地，不交给调用方"自觉"：
+并发与额度控制都在这一层：
 
-  - 每账号一把非阻塞锁 + 最小请求间隔（网页端对同账号并发极敏感）；
-  - **参考图先上传、后预留**：上传失败不该占用额度；
-  - 预留必须在 `except/finally` 里释放，否则异常路径会留下幽灵占用；
-  - 幂等键命中直接返回缓存副本，零消耗；
-  - 只有一次提交成功后才写缓存，失败/超时不写（避免把坏结果钉死 24h）。
+- 每个账号一把非阻塞锁，请求之间保留固定间隔；
+- 参考图先上传再预留，上传失败不影响账本；
+- 预留要在异常路径释放，否则会一直占用额度；
+- 幂等键命中时直接返回缓存，不再提交；
+- 只有提交成功的结果才写缓存，失败和超时不写。
 """
 
 from __future__ import annotations
@@ -336,7 +336,7 @@ class JimengClient:
         before: Optional[CreditSnapshot],
         after: Optional[CreditSnapshot],
     ) -> float:
-        """优先用余额差；拿不到前后余额时退化为预估值（宁可高估）。"""
+        """优先用余额差，拿不到前后余额时用预估值。"""
         if before is not None and after is not None:
             return round(max(0.0, before.total - after.total), 3)
         return plan.estimated_credits
