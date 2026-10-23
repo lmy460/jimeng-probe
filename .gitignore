@@ -10,12 +10,8 @@ dist/
 out/
 outputs/
 calibration.json
-.tmpx/
 *.log
 
-# 本地凭证（切勿提交）
+# 本地凭证
 .env
 .env.*
-
-# 会话记忆（内部笔记，不随项目发布）
-.workbuddy/

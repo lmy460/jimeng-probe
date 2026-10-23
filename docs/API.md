@@ -100,25 +100,25 @@ jimeng.jianying.com (/mweb/v1/*, /commerce/v1/*)
 
 | 参数 | 类型 | 必填 | 默认 | 约束与语义 |
 |---|---|---|---|---|
-| `prompt` | string | ✅ | — | 1–2000 字符；图生图时服务端隐式追加 `#` 占位，无需手写 |
-| `model` | string | | `jimeng-4.5` | `jimeng-3.0/3.1/4.0/4.1/4.5/4.6/5.0`；也接受内部 `req_key` |
-| `negative_prompt` | string | | `""` | ≤500 字符 |
-| `images` | array | | `[]` | 参考图，≤10 张；元素为 `{path}` / `{url}` / `{base64}` / `{asset_id}` / `{uri}`，也接受裸字符串（自动判别） |
-| `ratio` | string | | `1:1` | `21:9 16:9 3:2 4:3 3:4 2:3 9:16 1:1` 或 `auto`；`auto` 仅 4.0+ |
-| `resolution` | string | | `2k` | `1k / 2k / 4k`；须在模型支持集内（3.x 仅 1k/2k） |
-| `n` | int | | `1` | 1–4；**受最小计费粒度约束**，见 5.2 |
-| `seed` | int | | `-1` | `-1` 为随机 |
-| `sample_strength` | float | | `0.5` | 0–1，图生图参考强度 |
-| `intelligent_ratio` | bool | | `null` | 显式开关；`ratio=auto` 等价于 `true` |
-| `response_format` | string | | `url` | `url` 或 `b64_json` |
-| `wait` | bool | | `true` | `false` 时立即返回 `status=submitted` |
-| `timeout_s` | float | | `180` | 轮询总超时 |
-| `poll_interval_s` | float | | `3` | 轮询间隔（≥0.5） |
-| `max_credits` | float | | `null` | 单请求积分上限，超出直接拒绝（提交前拦截） |
-| `dry_run` | bool | | `false` | 只编译报文与算成本 |
-| `idempotency_key` | string | | `null` | 幂等键，缺省用请求指纹 |
-| `account_id` | string | | `null` | 指定账号；缺省按可用余额选择 |
-| `draft_content_encoding` | string | | `string` | `string`/`object`，上游两种都接受，用于兼容性探测 |
+| `prompt` | string | 是 | — | 1–2000 字符；图生图时服务端隐式追加 `#` 占位，无需手写 |
+| `model` | string | 否 | `jimeng-4.5` | `jimeng-3.0/3.1/4.0/4.1/4.5/4.6/5.0`；也接受内部 `req_key` |
+| `negative_prompt` | string | 否 | `""` | ≤500 字符 |
+| `images` | array | 否 | `[]` | 参考图，≤10 张；元素为 `{path}` / `{url}` / `{base64}` / `{asset_id}` / `{uri}`，也接受裸字符串（自动判别） |
+| `ratio` | string | 否 | `1:1` | `21:9 16:9 3:2 4:3 3:4 2:3 9:16 1:1` 或 `auto`；`auto` 仅 4.0+ |
+| `resolution` | string | 否 | `2k` | `1k / 2k / 4k`；须在模型支持集内（3.x 仅 1k/2k） |
+| `n` | int | 否 | `1` | 1–4；**受最小计费粒度约束**，见 5.2 |
+| `seed` | int | 否 | `-1` | `-1` 为随机 |
+| `sample_strength` | float | 否 | `0.5` | 0–1，图生图参考强度 |
+| `intelligent_ratio` | bool | 否 | `null` | 显式开关；`ratio=auto` 等价于 `true` |
+| `response_format` | string | 否 | `url` | `url` 或 `b64_json` |
+| `wait` | bool | 否 | `true` | `false` 时立即返回 `status=submitted` |
+| `timeout_s` | float | 否 | `180` | 轮询总超时 |
+| `poll_interval_s` | float | 否 | `3` | 轮询间隔（≥0.5） |
+| `max_credits` | float | 否 | `null` | 单请求积分上限，超出直接拒绝（提交前拦截） |
+| `dry_run` | bool | 否 | `false` | 只编译报文与算成本 |
+| `idempotency_key` | string | 否 | `null` | 幂等键，缺省用请求指纹 |
+| `account_id` | string | 否 | `null` | 指定账号；缺省按可用余额选择 |
+| `draft_content_encoding` | string | 否 | `string` | `string`/`object`，上游两种都接受，用于兼容性探测 |
 
 ### 5.2 四个必须理解的语义
 
@@ -294,19 +294,19 @@ curl -s localhost:8787/v1/images/generations -H 'Content-Type: application/json'
 
 | code | HTTP | retryable | 触发条件与处置 |
 |---|---|---|---|
-| `PARAM_INVALID` | 400 | ❌ | 参数缺失/越界；按 `details.available` 修正 |
-| `CAPABILITY_UNSUPPORTED` | 422 | ❌ | 模型不支持该分辨率/比例/参考图；换模型或降档 |
-| `AUTH_EXPIRED` | 401 | ❌ | sessionid 失效，重新登录取 Cookie |
-| `CREDIT_INSUFFICIENT` | 402 | ❌ | 余额不足；换账号或等次日重置 |
-| `BUDGET_EXCEEDED` | 402 | ❌ | 单请求上限或日配额触顶；调 `max_credits` |
-| `RATE_LIMITED` | 429 | ✅ | 频控；退避后重试 |
-| `ACCOUNT_BUSY` | 409 | ✅ | 账号被占用或上游并发超限（`1310`）；等待 |
-| `RISK_CONTROL` | 403 | ❌ | 上游风控（`4013`）；**不要重试**，换账号并降低频率 |
-| `CONTENT_FILTERED` | 422 | ❌ | 内容审核（`2038`）；改 prompt |
-| `TASK_FAILED` | 502 | ⚠️ | 生成失败（`status=30`）；已结算，可重试但会再扣费 |
-| `TASK_TIMEOUT` | 504 | ✅ | 轮询超时；任务可能仍在跑，**先查 history 再决定重提** |
-| `UPSTREAM_ERROR` | 502 | ✅ | 其他上游错误，透传 `ret/errmsg` |
-| `NOT_FOUND` | 404 | ❌ | 路由或任务不存在 |
+| `PARAM_INVALID` | 400 | 否 | 参数缺失/越界；按 `details.available` 修正 |
+| `CAPABILITY_UNSUPPORTED` | 422 | 否 | 模型不支持该分辨率/比例/参考图；换模型或降档 |
+| `AUTH_EXPIRED` | 401 | 否 | sessionid 失效，重新登录取 Cookie |
+| `CREDIT_INSUFFICIENT` | 402 | 否 | 余额不足；换账号或等次日重置 |
+| `BUDGET_EXCEEDED` | 402 | 否 | 单请求上限或日配额触顶；调 `max_credits` |
+| `RATE_LIMITED` | 429 | 是 | 频控；退避后重试 |
+| `ACCOUNT_BUSY` | 409 | 是 | 账号被占用或上游并发超限（`1310`）；等待 |
+| `RISK_CONTROL` | 403 | 否 | 上游风控（`4013`）；**不要重试**，换账号并降低频率 |
+| `CONTENT_FILTERED` | 422 | 否 | 内容审核（`2038`）；改 prompt |
+| `TASK_FAILED` | 502 | 视情况 | 生成失败（`status=30`）；已结算，可重试但会再扣费 |
+| `TASK_TIMEOUT` | 504 | 是 | 轮询超时；任务可能仍在跑，**先查 history 再决定重提** |
+| `UPSTREAM_ERROR` | 502 | 是 | 其他上游错误，透传 `ret/errmsg` |
+| `NOT_FOUND` | 404 | 否 | 路由或任务不存在 |
 
 ### 6.5 状态机
 
@@ -477,13 +477,13 @@ sha256(json.dumps({
 
 | 模型 | 内部 key | 单次张数 | 分辨率 | 参考图 | 智能比例 | 置信度 |
 |---|---|---|---|---|---|---|
-| jimeng-3.0 | `high_aes_general_v30l` | 1 | 1k/2k | ✅ | ❌ | default |
-| jimeng-3.1 | `high_aes_general_v30l_art_fangzhou` | 1 | 1k/2k | ✅ | ❌ | default |
-| jimeng-4.0 | `high_aes_general_v40` | 4 | 1k/2k/4k | ✅ | ✅ | default |
-| jimeng-4.1 | `high_aes_general_v41` | 4 | 1k/2k/4k | ✅ | ✅ | default |
-| jimeng-4.5 | `high_aes_general_v40l` | 4 | 1k/2k/4k | ✅ | ✅ | default |
-| jimeng-4.6 | `high_aes_general_v42` | 4 | 1k/2k/4k | ✅ | ✅ | default |
-| jimeng-5.0 | `high_aes_general_v50` | 4 | 1k/2k/4k | ✅ | ✅ | default |
+| jimeng-3.0 | `high_aes_general_v30l` | 1 | 1k/2k | 支持 | 不支持 | default |
+| jimeng-3.1 | `high_aes_general_v30l_art_fangzhou` | 1 | 1k/2k | 支持 | 不支持 | default |
+| jimeng-4.0 | `high_aes_general_v40` | 4 | 1k/2k/4k | 支持 | 支持 | default |
+| jimeng-4.1 | `high_aes_general_v41` | 4 | 1k/2k/4k | 支持 | 支持 | default |
+| jimeng-4.5 | `high_aes_general_v40l` | 4 | 1k/2k/4k | 支持 | 支持 | default |
+| jimeng-4.6 | `high_aes_general_v42` | 4 | 1k/2k/4k | 支持 | 支持 | default |
+| jimeng-5.0 | `high_aes_general_v50` | 4 | 1k/2k/4k | 支持 | 支持 | default |
 
 > `default` 表示"据公开抓包与网页行为整理"，非本机实测。
 > 跑一次 `probe --live --probes count,cost --model <M> --write` 即可升级为 `calibrated`。

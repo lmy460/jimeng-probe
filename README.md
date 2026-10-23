@@ -9,7 +9,7 @@
 |---|---|
 | [`docs/DESIGN.md`](docs/DESIGN.md) | **项目说明**：设计取舍、探测发现的规则（张数不是自由变量等）、成本模型、已知未知 |
 | [`docs/API.md`](docs/API.md) | **接口契约**：参数定义、返回结构、错误码、积分与复用约束 |
-| [`docs/REVIEW.md`](docs/REVIEW.md) | **代码审查记录**：12 处缺陷的定位、后果、修复与回归用例 |
+| [`docs/REVIEW.md`](docs/REVIEW.md) | **缺陷与修复记录**：14 个问题的成因、处理与回归用例 |
 
 ## 快速开始
 
@@ -41,6 +41,19 @@ jimeng models
 ```
 
 最小 SDK 示例见 [`examples/quickstart.py`](examples/quickstart.py)。
+
+## 配置项
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `JIMENG_SESSIONID` | 网页登录后的 sessionid | 无（必填才能真实调用） |
+| `JIMENG_ACCOUNTS` | 多账号，格式 `acc1:sid1,acc2:sid2` | 空 |
+| `JIMENG_REGION` | 区域标识，当前仅支持 `cn` | `cn` |
+| `JIMENG_COOLDOWN_S` | 同账号两次请求的最小间隔（秒） | `3` |
+| `JIMENG_DAILY_QUOTA` | 单账号每日积分上限 | `66` |
+| `JIMENG_MAX_CREDITS_PER_REQUEST` | 单次请求积分上限 | 不限制 |
+| `JIMENG_GATEWAY_TOKEN` | 网关 Bearer 令牌 | 空（不校验，仅限本机） |
+| `JIMENG_CALIBRATION` | 校准文件路径 | 项目根目录 `calibration.json` |
 
 ## 六条核心规则（细节见 DESIGN.md）
 
@@ -84,7 +97,7 @@ jimeng/
 docs/
   DESIGN.md       项目说明与探测规则
   API.md          接口规格
-  REVIEW.md       代码审查记录
+  REVIEW.md       缺陷与修复记录
 examples/
   quickstart.py   最小可运行示例
 tests/
